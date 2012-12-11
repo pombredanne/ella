@@ -1,156 +1,261 @@
-from datetime import datetime, timedelta
+from operator import attrgetter
 
 from django.db import models
-from django.db.models import F, Q
-from django.conf import settings
-from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ImproperlyConfigured
 from django.utils.encoding import smart_str
+from django.db.models.loading import get_model
+from django.conf import settings
 
 from ella.core.cache import cache_this
-from ella.core.cache.invalidate import CACHE_DELETER
 from ella.core.conf import core_settings
+from ella.utils import timezone, import_module_member
+
+
+class PublishableManager(models.Manager):
+    def current(self, now=None):
+        now = timezone.now().replace(second=0, microsecond=0)
+
+        return self.filter(
+            models.Q(publish_to__isnull=True) | models.Q(publish_to__gt=now),
+            published=True, publish_from__lte=now
+        )
+
+
+class CategoryManager(models.Manager):
+    _cache = {}
+    _hierarchy = {}
+
+    def get_for_id(self, pk):
+        try:
+            return self.__class__._cache[settings.SITE_ID][pk]
+        except KeyError:
+            cat = self.get(pk=pk)
+            self._add_to_cache(cat)
+            return cat
+
+    def get_by_tree_path(self, tree_path):
+        try:
+            return self.__class__._cache[settings.SITE_ID][tree_path]
+        except KeyError:
+            cat = self.get(site=settings.SITE_ID, tree_path=tree_path)
+            self._add_to_cache(cat)
+            return cat
+
+    def _add_to_cache(self, category):
+        cache = self.__class__._cache.setdefault(category.site_id, {})
+        # pk and tree_path can never clash, safe to store in one dict
+        cache[category.pk] = category
+        cache[category.tree_path] = category
+
+    def clear_cache(self):
+        self.__class__._cache.clear()
+        self.__class__._hierarchy.clear()
+
+    def _load_hierarchy(self, site_id):
+        cache = self.__class__._cache.setdefault(site_id, {})
+        hierarchy = self.__class__._hierarchy.setdefault(site_id, {})
+        for c in self.filter(site=site_id).order_by('title'):
+            # make sure we are working with the instance already in cache
+            c = cache.setdefault(c.id, c)
+            hierarchy.setdefault(c.tree_parent_id, []).append(c)
+
+    def _retrieve_children(self, category):
+        if not self.__class__._hierarchy:
+            self._load_hierarchy(category.site_id)
+        return self.__class__._hierarchy[category.site_id].get(category.pk, [])
+
+    def get_children(self, category, recursive=False):
+        #make sure this is the instance stored in our cache
+        self._add_to_cache(category)
+        # copy the returned list. if recursive, we extend it below
+        children = self._retrieve_children(category)[:]
+        if recursive:
+            to_process = children[:]
+            while to_process:
+                grand_children = self._retrieve_children(to_process.pop())
+                children.extend(grand_children)
+                to_process.extend(grand_children)
+            children = sorted(children, key=attrgetter('tree_path'))
+        return children
 
 
 class RelatedManager(models.Manager):
-    def get_related_for_object(self, obj, count, mods=[], only_from_same_site=True):
-        from ella.core.models import Publishable
+    def collect_related(self, finder_funcs, obj, count, *args, **kwargs):
+        """
+        Collects objects related to ``obj`` using a list of ``finder_funcs``.
+        Stops when required count is collected or the function list is
+        exhausted.
+        """
+        collected = []
+        for func in finder_funcs:
+            gathered = func(obj, count, collected, *args, **kwargs)
+            if gathered:
+                collected += gathered
+            if len(collected) >= count:
+                return collected[:count]
 
-        # manually entered dependencies
+        return collected
 
-        qset = Publishable.objects.filter(
-                related__related_ct=ContentType.objects.get_for_model(obj),
-                related__related_id=obj.pk
-            )
-        if mods:
-            ct_ids = [ContentType.objects.get_for_model(m).pk for m in mods]
-            qset = qset.filter(content_type__in=ct_ids)
-        if only_from_same_site:
-            qset = qset.filter(category__site__pk=settings.SITE_ID)
-        related = list(qset[:count])
+    def _get_finders(self, finder):
+        if not hasattr(self, '_finders'):
+            self._finders = {}
+            for key, finders_modstr in core_settings.RELATED_FINDERS.items():
+                # accept non-iterables too (single member named finders)
+                if not hasattr(finders_modstr, '__iter__'):
+                    finders_modstr = (finders_modstr,)
 
-        if len(related) >= count:
-            return related
+                # gather all functions before actual use to prevent import errors
+                # during the real process
+                finder_funcs = []
+                for finder_modstr in finders_modstr:
+                    finder_funcs.append(import_module_member(finder_modstr, 'related finder'))
 
-        count -= len(related)
+                self._finders[key] = finder_funcs
 
-        # related objects via tags
-        try:
-            from tagging.models import TaggedItem
-            if TaggedItem._meta.installed:
-                # we are only tagging Publishables, not individual content types
-                if isinstance(obj, Publishable):
-                    obj = obj.publishable_ptr
+        if finder is None:
+            finder = 'default'
 
-                qset = Publishable.objects.filter(
-                        placement__publish_from__lte=datetime.now(),
-                    ).distinct()
-                if mods:
-                    qset = qset.filter(content_type__in=ct_ids)
-                if only_from_same_site:
-                    qset = qset.filter(category__site__pk=settings.SITE_ID)
+        if not finder in self._finders:
+            raise ImproperlyConfigured('Named finder %r specified but cannot be '
+                'found in RELATED_FINDERS settings.' % finder)
+        return self._finders[finder]
 
-                #print qset
-                #print TaggedItem.objects.all()
-                to_add = TaggedItem.objects.get_related(obj, qset, num=count+len(related))
-                #print to_add
-                for rel in to_add:
-                    if rel != obj and rel not in related:
-                        count -= 1
-                        related.append(rel)
-                    if count <= 0:
-                        return related
-        except ImportError, e:
-            pass
+    def get_related_for_object(self, obj, count, finder=None, mods=[], only_from_same_site=True):
+        """
+        Returns at most ``count`` publishable objects related to ``obj`` using
+        named related finder ``finder``.
 
-        # top objects in given category
-        if count > 0:
-            from ella.core.models import Listing
-            cat = obj.category
-            listings = Listing.objects.get_listing(category=cat, count=count+len(related), mods=mods)
-            for l in listings:
-                t = l.target
-                if t != obj and t not in related:
-                    related.append(t)
-                    count -= 1
+        If only specific type of publishable is prefered, use ``mods`` attribute
+        to list required classes.
 
-                if count <= 0:
-                    return related
+        Finally, use ``only_from_same_site`` if you don't want cross-site
+        content.
 
-        return related
+        ``finder`` atribute uses ``RELATED_FINDERS`` settings to find out
+        what finder function to use. If none is specified, ``default``
+        is used to perform the query.
+        """
+        return self.collect_related(self._get_finders(finder), obj, count, mods, only_from_same_site)
 
 
-def invalidate_listing(key, self, *args, **kwargs):
-    CACHE_DELETER.register_test(self.model, '', key)
-
-def get_listings_key(func, self, category=None, count=10, offset=1, mods=[], content_types=[], **kwargs):
-    c = category and  category.id or ''
-
-    return 'ella.core.managers.ListingManager.get_listing:%s:%d:%d:%s:%s:%s' % (
-            c, count, offset,
-            ','.join(str(model._meta) for model in mods),
-            ','.join(map(str, content_types)),
-            ','.join(':'.join((k, smart_str(v))) for k, v in kwargs.items()),
-    )
-
-class PlacementManager(models.Manager):
-    def get_query_set(self, *args, **kwargs):
-        qset = super(PlacementManager, self).get_query_set(*args, **kwargs).select_related('publishable')
-        return qset
-
-    def get_static_placements(self, category):
-        now = datetime.now()
-        return self.filter(models.Q(publish_to__gt=now) | models.Q(publish_to__isnull=True),  publish_from__lt=now, category=category, static=True)
-
-class ListingManager(models.Manager):
+class ListingHandler(object):
     NONE = 0
     IMMEDIATE = 1
     ALL = 2
 
+    @classmethod
+    def regenerate(cls, today=None):
+        pass
+
+    def __init__(self, category, children=NONE, content_types=[],
+                 date_range=(), exclude=None, **kwargs):
+        self.category = category
+        self.children = children
+        self.content_types = content_types
+        self.date_range = date_range
+        self.exclude = exclude
+        self.kwargs = kwargs
+
+    def __getitem__(self, k):
+        if isinstance(k, int):
+            return self.get_listing(k)
+
+        if not isinstance(k, slice) or k.step:
+            raise TypeError, '%s, %s' % (k.start, k.stop)
+
+        offset = k.start or 0
+
+        if offset < 0 or k.stop is None  or k.stop < offset:
+            raise TypeError, '%s, %s' % (k.start, k.stop)
+
+        count = k.stop - offset
+
+        return self.get_listings(offset, count)
+
+    def get_listings(self, offset=0, count=10):
+        raise NotImplementedError
+
+    def get_listing(self, i):
+        return self.get_listings(i, i + 1)[0]
+
+    def count(self):
+        raise NotImplementedError
+
+    def __len__(self):
+        return self.count()
+
+
+def get_listings_key(self, category=None, children=ListingHandler.NONE, count=10, offset=0, content_types=[], date_range=(), exclude=None, **kwargs):
+    c = category and  category.id or ''
+
+    return 'core.get_listing:%s:%d:%d:%d:%d:%s:%s:%s' % (
+            c, count, offset, children, exclude.id if exclude else 0,
+            ','.join(map(lambda ct: str(ct.pk), content_types)),
+            ','.join(map(lambda d: d.strftime('%Y%m%d'), date_range)),
+            ','.join(':'.join((k, smart_str(v))) for k, v in kwargs.items()),
+    )
+
+
+class ListingManager(models.Manager):
     def clean_listings(self):
         """
         Method that cleans the Listing model by deleting all listings that are no longer valid.
         Should be run periodicaly to purge the DB from unneeded data.
         """
-        self.filter(publish_to__lt=datetime.now()).delete()
+        self.filter(publish_to__lt=timezone.now()).delete()
 
     def get_query_set(self, *args, **kwargs):
         # get all the fields you typically need to render listing
         qset = super(ListingManager, self).get_query_set(*args, **kwargs).select_related(
-                'placement',
-                'placement__category',
-                'placement__publishable',
-                'placement__publishable__category',
-                'placement__publishable__content_type'
+                'publishable',
+                'publishable__category',
             )
         return qset
 
-    def get_listing_queryset(self, category=None, children=NONE, mods=[], content_types=[], now=None, **kwargs):
-        if not now:
-            now = datetime.now()
-        qset = self.filter(publish_from__lte=now, **kwargs)
+    def get_listing_queryset(self, category=None, children=ListingHandler.NONE, content_types=[], date_range=(), exclude=None, **kwargs):
+        # give the database some chance to cache this query
+        now = timezone.now().replace(second=0, microsecond=0)
+
+        if date_range:
+            qset = self.filter(publish_from__range=date_range, publishable__published=True, **kwargs)
+        else:
+            qset = self.filter(publish_from__lte=now, publishable__published=True, **kwargs)
 
         if category:
-            if children == self.NONE:
+            if children == ListingHandler.NONE:
                 # only this one category
                 qset = qset.filter(category=category)
-            elif children == self.IMMEDIATE:
+            elif children == ListingHandler.IMMEDIATE:
                 # this category and its children
                 qset = qset.filter(models.Q(category__tree_parent=category) | models.Q(category=category))
-            elif children == self.ALL:
+
+                for c in category.get_children():
+                    if not c.app_data.ella.propagate_listings:
+                        qset = qset.exclude(category=c)
+
+            elif children == ListingHandler.ALL:
                 # this category and all its descendants
                 qset = qset.filter(category__tree_path__startswith=category.tree_path, category__site=category.site_id)
+
+                for c in category.get_children(True):
+                    if not c.app_data.ella.propagate_listings:
+                        qset = qset.exclude(category__tree_path__startswith=c.tree_path)
 
             else:
                 raise AttributeError('Invalid children value (%s) - should be one of (%s, %s, %s)' % (children, self.NONE, self.IMMEDIATE, self.ALL))
 
         # filtering based on Model classes
-        if mods or content_types:
-            qset = qset.filter(placement__publishable__content_type__in=([ ContentType.objects.get_for_model(m) for m in mods ] + content_types))
+        if content_types:
+            qset = qset.filter(publishable__content_type__in=content_types)
 
-        return qset.exclude(publish_to__lt=now)
+        # we were asked to omit certain Publishable
+        if exclude:
+            qset = qset.exclude(publishable=exclude)
 
-    @cache_this(get_listings_key, invalidate_listing)
-    def get_listing(self, category=None, children=NONE, count=10, offset=1, mods=[], content_types=[], unique=None, **kwargs):
+        return qset.exclude(publish_to__lt=now).order_by('-publish_from')
+
+    @cache_this(get_listings_key)
+    def get_listing(self, category=None, children=ListingHandler.NONE, count=10, offset=0, content_types=[], date_range=(), exclude=None, **kwargs):
         """
         Get top objects for given category and potentionally also its child categories.
 
@@ -158,145 +263,108 @@ class ListingManager(models.Manager):
             category - Category object to list objects for. None if any category will do
             count - number of objects to output, defaults to 10
             offset - starting with object number... 1-based
-            mods - list of Models, if empty, object from all models are included
-            [now] - datetime used instead of default datetime.now() value
-            [unique] - set of already listed Placement IDs
+            content_types - list of ContentTypes to list, if empty, object from all models are included
+            date_range - range for listing's publish_from field
             **kwargs - rest of the parameter are passed to the queryset unchanged
         """
-        def mark_before_output(output):
-            for l in output:
-                listed_targets.add(l.placement_id)
-
-        def make_items_unique(qset):
-
-            out = []
-            listed_targets_now = set()
-            for l in qset:
-                tgt = l.placement_id
-                if tgt in listed_targets or tgt in listed_targets_now:
-                    continue
-                listed_targets_now.add(tgt)
-                out.append(l)
-                if len(out) == limit:
-                    result = out[offset:limit]
-                    mark_before_output(result)
-                    return result
-            mark_before_output(out)
-            return out
-
-        # TODO try to write  SQL (.extra())
-        assert offset > 0, "Offset must be a positive integer"
+        assert offset >= 0, "Offset must be a positive integer"
         assert count >= 0, "Count must be a positive integer"
 
         if not count:
             return []
 
-        now = datetime.now()
-        if 'now' in kwargs:
-            now = kwargs.pop('now')
-        qset = self.get_listing_queryset(category, children, mods, content_types, now, **kwargs)
-
-        # templates are 1-based, compensate
-        offset -= 1
         limit = offset + count
 
-        # take out unwanted objects
-        if unique:
-            listed_targets = unique.copy()
-        else:
-            listed_targets = set([])
+        qset = self.get_listing_queryset(category, children, content_types, date_range, exclude, **kwargs)
 
-        # only use priorities if somebody wants them
-        if not core_settings.USE_PRIORITIES:
-            if unique:
-                return make_items_unique(qset)
+        # direct listings, we don't need to check for duplicates
+        if children == ListingHandler.NONE:
             return qset[offset:limit]
 
-
-        # listings with active priority override
-        active = models.Q(
-                    priority_value__isnull=False,
-                    priority_from__isnull=False,
-                    priority_from__lte=now,
-                    priority_to__gte=now
-        )
-
-        qsets = (
-            # modded-up objects
-            qset.filter(active, priority_value__gt=core_settings.DEFAULT_LISTING_PRIORITY).order_by('-priority_value', '-publish_from'),
-            # default priority
-            qset.exclude(active).order_by('-publish_from'),
-            # modded-down priority
-            qset.filter(active, priority_value__lt=core_settings.DEFAULT_LISTING_PRIORITY).order_by('-priority_value', '-publish_from'),
-        )
-
+        seen = set()
         out = []
+        while len(out) < count:
+            skip = 0
+            # 2 i a reasonable value for padding, wouldn't you say dear Watson?
+            for l in qset[offset:limit + 2]:
+                if l.publishable_id not in seen:
+                    seen.add(l.publishable_id)
+                    out.append(l)
+                    if len(out) == count:
+                        break
+                else:
+                    skip += 1
 
-        # iterate through qsets until we have enough objects
-        for q in qsets:
-            data = q.iterator()
-            for l in data:
-                tgt = l.placement_id
-                if tgt in listed_targets:
-                    continue
-                listed_targets.add(tgt)
-                out.append(l)
-                if len(out) == limit:
-                    return out[offset:limit]
-        return out[offset:offset + count]
+            # no enough skipped, or not enough listings to work with, no need for another try
+            if skip <= 2 or (len(out) + skip) < (count + 2):
+                break
 
-    def get_queryset_wrapper(self, kwargs):
-        return ListingQuerySetWrapper(self, kwargs)
+            # get another page to fill in the gaps
+            offset += count
+            limit += count
 
-class ListingQuerySetWrapper(object):
-    def __init__(self, manager, kwargs):
-        self.manager = manager
-        self._kwargs = kwargs
+        return out
 
-    def __getitem__(self, k):
-        if not isinstance(k, slice) or (k.start is None or k.start < 0) or (k.stop is None  or k.stop < k.start):
-            raise TypeError, '%s, %s' % (k.start, k.stop)
+    def get_listing_handler(self, source, fallback=True):
+        if not hasattr(self, '_listing_handlers'):
+            self._listing_handlers = {}
+            for k, v in core_settings.LISTING_HANDLERS.items():
+                self._listing_handlers[k] = import_module_member(v, 'Listing Handler')
 
-        offset = k.start + 1
-        count = k.stop - k.start
+            if 'default' not in self._listing_handlers:
+                raise ImproperlyConfigured('You didn\'t specify any default Listing Handler.')
 
-        return self.manager.get_listing(offset=offset, count=count, **self._kwargs)
+        if source in self._listing_handlers:
+            return self._listing_handlers[source]
+        elif not fallback:
+            return None
+
+        if settings.DEBUG:
+            raise ImproperlyConfigured('ListingHandler %s is not defined in settings.' % source)
+
+        return self._listing_handlers['default']
+
+    def get_queryset_wrapper(self, category, children=ListingHandler.NONE,
+                             content_types=[], date_range=(), exclude=None,
+                             source='default', **kwargs):
+        ListingHandler = self.get_listing_handler(source)
+        return ListingHandler(
+            category, children, content_types, date_range, exclude, **kwargs
+        )
+
+
+class ModelListingHandler(ListingHandler):
+    def get_listing(self, i):
+        Listing = get_model('core', 'listing')
+        return Listing.objects.get_listing_queryset(
+                self.category,
+                children=self.children,
+                content_types=self.content_types,
+                date_range=self.date_range,
+                exclude=self.exclude
+            )[i]
+
+    def get_listings(self, offset=0, count=10):
+        Listing = get_model('core', 'listing')
+        return Listing.objects.get_listing(
+                self.category,
+                children=self.children,
+                content_types=self.content_types,
+                date_range=self.date_range,
+                offset=offset,
+                count=count,
+                exclude=self.exclude
+            )
 
     def count(self):
         if not hasattr(self, '_count'):
-            self._count = self.manager.get_listing_queryset(**self._kwargs).count()
+            Listing = get_model('core', 'listing')
+            self._count = Listing.objects.get_listing_queryset(
+                self.category,
+                children=self.children,
+                content_types=self.content_types,
+                date_range=self.date_range,
+                exclude=self.exclude
+            ).count()
         return self._count
 
-
-def get_top_objects_key(func, self, count, days=None, mods=[]):
-    return 'ella.core.managers.HitCountManager.get_top_objects_key:%d:%d:%s:%s' % (
-            settings.SITE_ID, count, str(days), ','.join('.'.join(str(model._meta) for model in mods))
-        )
-
-class HitCountManager(models.Manager):
-
-    def hit(self, placement):
-        count = self.filter(placement=placement).update(hits=F('hits')+1)
-
-        if count < 1:
-            self.create(placement=placement, hits=1)
-
-    @cache_this(get_top_objects_key)
-    def get_top_objects(self, count, days=None, mods=[]):
-        """
-        Return count top rated objects. Cache this for 10 minutes without any chance of cache invalidation.
-        """
-        qset = self.filter(placement__category__site=settings.SITE_ID).order_by('-hits')
-
-        if mods:
-            qset = qset.filter(placement__publishable__content_type__in = [ ContentType.objects.get_for_model(m) for m in mods ])
-
-        now = datetime.now()
-        if days is None:
-            qset = qset.filter(placement__publish_from__lte=now)
-        else:
-            start = now - timedelta(days=days)
-            qset = qset.filter(placement__publish_from__range=(start, now,))
-        qset = qset.filter(Q(placement__publish_to__gt=now) | Q(placement__publish_to__isnull=True))
-
-        return list(qset[:count])

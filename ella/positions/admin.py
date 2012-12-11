@@ -1,11 +1,11 @@
-from datetime import datetime
 from django.contrib import admin
 from django.utils.translation import ugettext, ugettext_lazy as _
 
-from ella.ellaadmin.options import EllaAdminOptionsMixin
 from ella.positions.models import Position
+from ella.utils import timezone
 
-class PositionOptions(EllaAdminOptionsMixin, admin.ModelAdmin):
+
+class PositionOptions(admin.ModelAdmin):
     def show_title(self, obj):
         if not obj.target:
             return '-- %s --' % ugettext('empty position')
@@ -24,7 +24,7 @@ class PositionOptions(EllaAdminOptionsMixin, admin.ModelAdmin):
     def is_active(self, obj):
         if obj.disabled:
             return False
-        now = datetime.now()
+        now = timezone.now()
         active_from = not obj.active_from or obj.active_from <= now
         active_till = not obj.active_till or obj.active_till > now
         return active_from and active_till

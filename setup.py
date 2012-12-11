@@ -1,31 +1,39 @@
 from setuptools import setup, find_packages
+import ella
 
-# must be in sync with ella.VERSION
-VERSION = (2, 0, 1)
-__version__ = VERSION
-__versionstr__ = '.'.join(map(str, VERSION))
+install_requires = [
+    'setuptools>=0.6b1',
+    'Django>=1.3.1',
+    'south>=0.7',
+    'pytz',
+    'django-appdata>=0.1.0',
+]
+
+test_requires = [
+    'nose',
+    'coverage',
+    'feedparser',
+    'redis',
+]
+
+long_description = open('README.rst').read()
 
 setup(
-    name = 'ella',
-    version = __versionstr__,
-    description = 'Ella - Django powered CMS',
-    long_description = '\n'.join((
-        'Ella Django CMS Project',
-        '',
-        'content management system written in Django',
-        '',
-    )),
-    author = 'Ella Development Team',
+    name='ella',
+    version=ella.__versionstr__,
+    description='Ella - Django powered CMS',
+    long_description=long_description,
+    author='Ella Development Team',
     author_email='dev@ella-cms.com',
-    license = 'BSD',
-    url='http://ella.github.com/',
+    license='BSD',
+    url='https://github.com/ella/ella',
 
-    packages = find_packages(
-        where = '.',
-        exclude = ('doc', 'tests', 'debian',)
+    packages=find_packages(
+        where='.',
+        exclude=('doc', 'test_ella', )
     ),
 
-    include_package_data = True,
+    include_package_data=True,
 
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -40,18 +48,8 @@ setup(
         "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
         "Topic :: Software Development :: Libraries :: Python Modules",
     ],
-    install_requires = [
-        'setuptools>=0.6b1',
-        'Django==1.3.1',
-        'south>=0.7',
-        'anyjson',
-        'feedparser',
-        'PIL',
-        'django-tagging',
-        'djangomarkup',
-    ],
-    setup_requires = [
-        'setuptools_dummy',
-    ],
+    install_requires=install_requires,
 
+    test_suite='test_ella.run_tests.run_all',
+    test_requires=test_requires,
 )

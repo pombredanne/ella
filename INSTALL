@@ -1,16 +1,26 @@
-Requirements
-============
+To install Ella CMS, make sure you have Python 2.5 or greater installed.
 
-  * Python 2.5+
-  * Django 1.1 (with patch from #3400)
-  * python-markdown2 (or python-markdown)
-  * PIL
-  * python-cjson (optional)
-  * django-markup (optional)
+Then run this command from the command prompt:
 
-For testing:
-------------
+    python setup.py install
 
-  * python-nose
-  * djangosanetesting
+Or install latest Ella CMS from PyPi:
+
+    pip install ella
+
+This installs all Ella dependencies, except binary packages such as PIL
+and database driver of your choice.
+
+
+For development, we recommend use virtualenv (and wrapper) like this:
+
+    $ git clone git://github.com/ella/ella.git
+    $ cd ella
+    $ mkvirtualenv ella
+    $ pip install -r dev_requirements.txt
+
+Then you can test this installation:
+
+    $ cd test_ella
+    $ ./test_ella/run_tests.py
 

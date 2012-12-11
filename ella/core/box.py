@@ -1,10 +1,10 @@
 from django.template import loader
 from django.utils.datastructures import MultiValueDict
 from django.utils.encoding import smart_str
+from django.db.models import Model
 from django.core.cache import cache
 from django.conf import settings
 
-from ella.core.cache.invalidate import CACHE_DELETER
 from ella.core.cache.utils import normalize_key
 from ella.core.conf import core_settings
 
@@ -32,26 +32,24 @@ class Box(object):
         if not model:
             model = obj.__class__
 
-        self.opts = model._meta
-        self.verbose_name = model._meta.verbose_name
-        self.verbose_name_plural = model._meta.verbose_name_plural
+        self.name = model.__name__.lower()
+        self.verbose_name = model.__name__
+        self.verbose_name_plural = model.__name__
 
+        self.is_model = issubclass(model, Model)
 
-    def parse_params(self, definition):
-        " A helper function to parse the parameters inside the box tag. "
-        for line in definition.split('\n'):
-            pair = line.split(':', 1)
-            if len(pair) == 2:
-                yield (pair[0].strip(), pair[1].strip())
-            else:
-                pass
-                # TODO log warning
+        if hasattr(model, '_meta'):
+            self.name = str(model._meta)
+            self.verbose_name = model._meta.verbose_name
+            self.verbose_name_plural = model._meta.verbose_name_plural
 
-    def resolve_params(self, context):
+    def resolve_params(self, text):
         " Parse the parameters into a dict. "
         params = MultiValueDict()
-        for key, value in self.parse_params(self.nodelist.render(context)):
-            params.appendlist(key, value)
+        for line in text.split('\n'):
+            pair = line.split(':', 1)
+            if len(pair) == 2:
+                params.appendlist(pair[0].strip(), pair[1].strip())
         return params
 
     def prepare(self, context):
@@ -59,11 +57,25 @@ class Box(object):
         Do the pre-processing - render and parse the parameters and
         store them for further use in self.params.
         """
-        context.push()
-        context['object'] = self.obj
-        self.params = self.resolve_params(context)
-        context.pop()
-        self._context = context
+        self.params = {}
+
+        # no params, not even a newline
+        if not self.nodelist:
+            return
+
+        # just static text, no vars, assume one TextNode
+        if not self.nodelist.contains_nontext:
+            text = self.nodelist[0].s.strip()
+
+        # vars in params, we have to render
+        else:
+            context.push()
+            context['object'] = self.obj
+            text = self.nodelist.render(context)
+            context.pop()
+
+        if text:
+            self.params = self.resolve_params(text)
 
         # override the default template from the parameters
         if 'template_name' in self.params:
@@ -71,59 +83,36 @@ class Box(object):
 
     def get_context(self):
         " Get context to render the template. "
-        if 'level' in self.params and self.params['level'].isdigit():
-            level = int(self.params['level'])
-        else:
-            level = 1
-
         return {
-                'content_type_name' : str(self.opts),
+                'content_type_name' : str(self.name),
                 'content_type_verbose_name' : self.verbose_name,
                 'content_type_verbose_name_plural' : self.verbose_name_plural,
                 'object' : self.obj,
-                'level' : level,
-                'next_level' : level + 1,
-                'css_class' : self.params.get('css_class', ''),
-                'name' : self.params.get('name', ''),
-                'text' : self.params.get('text', ''),
-                'align' : self.params.get('align', 'left'),
                 'box' : self,
         }
 
-    def get_cache_tests(self):
-        " Return tests for ella.core.cache.invalidate "
-        from ella.db_templates.models import DbTemplate
-        if not DbTemplate._meta.installed:
-            return []
-        return [ (DbTemplate, 'name:%s' % t) for t in self._get_template_list() ]
-
-    def render(self):
+    def render(self, context):
+        self.prepare(context)
         " Cached wrapper around self._render(). "
         if getattr(settings, 'DOUBLE_RENDER', False) and self.can_double_render:
-            if 'SECOND_RENDER' not in self._context:
+            if 'SECOND_RENDER' not in context:
                 return self.double_render()
         key = self.get_cache_key()
-        rend = cache.get(key)
-        if rend is None:
-            rend = self._render()
-            cache.set(key, rend, core_settings.CACHE_TIMEOUT)
-            for model, test in self.get_cache_tests():
-                CACHE_DELETER.register_test(model, test, key)
-            CACHE_DELETER.register_pk(self.obj, key)
+        if key:
+            rend = cache.get(key)
+            if rend is None:
+                rend = self._render(context)
+                cache.set(key, rend, core_settings.CACHE_TIMEOUT)
+        else:
+            rend = self._render(context)
         return rend
 
     def double_render(self):
-        if self.template_name:
-            t_name = self.template_name
-        else:
-            t_name = loader.select_template(self._get_template_list()).name
-
-        return '''{%% box %(box_type)s for %(opts)s with pk %(pk)s %%}template_name: %(template_name)s\n%(params)s{%% endbox %%}''' % {
+        return '''{%% box %(box_type)s for %(name)s with pk %(pk)s %%}%(params)s{%% endbox %%}''' % {
                 'box_type' : self.box_type,
-                'opts' : self.opts,
+                'name' : self.name,
                 'pk' : self.obj.pk,
                 'params' : '\n'.join(('%s:%s' % item for item in self.params.items())),
-                'template_name' : t_name,
         }
 
     def _get_template_list(self):
@@ -131,13 +120,13 @@ class Box(object):
         t_list = []
         if hasattr(self.obj, 'category_id') and self.obj.category_id:
             cat = self.obj.category
-            base_path = 'box/category/%s/content_type/%s/' % (cat.path, self.opts)
+            base_path = 'box/category/%s/content_type/%s/' % (cat.path, self.name)
             if hasattr(self.obj, 'slug'):
                 t_list.append(base_path + '%s/%s.html' % (self.obj.slug, self.box_type,))
             t_list.append(base_path + '%s.html' % (self.box_type,))
             t_list.append(base_path + 'box.html')
 
-        base_path = 'box/content_type/%s/' % self.opts
+        base_path = 'box/content_type/%s/' % self.name
         if hasattr(self.obj, 'slug'):
             t_list.append(base_path + '%s/%s.html' % (self.obj.slug, self.box_type,))
         t_list.append(base_path + '%s.html' % (self.box_type,))
@@ -148,7 +137,7 @@ class Box(object):
 
         return t_list
 
-    def _render(self):
+    def _render(self, context):
         " The main function that takes care of the rendering. "
         if self.template_name:
             t = loader.get_template(self.template_name)
@@ -156,18 +145,21 @@ class Box(object):
             t_list = self._get_template_list()
             t = loader.select_template(t_list)
 
-        self._context.update(self.get_context())
-        resp = t.render(self._context)
-        self._context.pop()
+        context.update(self.get_context())
+        resp = t.render(context)
+        context.pop()
         return resp
 
     def get_cache_key(self):
         " Return a cache key constructed from the box's parameters. "
+        if not self.is_model:
+            return None
+
         if self.params:
             pars = ','.join(':'.join((smart_str(key), smart_str(self.params[key]))) for key in sorted(self.params.keys()))
         else:
             pars = ''
-        return normalize_key('ella.core.box.Box.render:%d:%s:%s:%d:%s' % (
-                    settings.SITE_ID, self.obj.__class__.__name__, str(self.box_type), self.obj.pk, pars
-                ))
+        return normalize_key('core.box:%d:%s:%s:%d:%s' % (
+                settings.SITE_ID, self.obj.__class__.__name__, str(self.box_type), self.obj.pk, pars
+            ))
 

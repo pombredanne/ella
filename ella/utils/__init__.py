@@ -1,12 +1,16 @@
-import unicodedata
+from django.core.exceptions import ImproperlyConfigured
+from django.utils.importlib import import_module
 
-def remove_diacritical(text):
-    " Removes diacritical from text. "
-    line = unicode(text, 'utf-8')
-    line = unicodedata.normalize('NFKD', line)
+def import_module_member(modstr, noun=''):
+    module, attr = modstr.rsplit('.', 1)
+    try:
+        mod = import_module(module)
+    except ImportError, e:
+        raise ImproperlyConfigured('Error importing %s %s: "%s"' % (noun, modstr, e))
+    try:
+        member = getattr(mod, attr)
+    except AttributeError, e:
+        raise ImproperlyConfigured('Error importing %s %s: "%s"' % (noun, modstr, e))
+    return member
 
-    output = ''
-    for c in line:
-        if not unicodedata.combining(c):
-            output += c
-    return output
+

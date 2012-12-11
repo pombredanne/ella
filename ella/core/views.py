@@ -1,22 +1,66 @@
-from datetime import datetime, date
+from datetime import datetime, timedelta
 
-from django.contrib.contenttypes.models import ContentType
-from django.core.paginator import Paginator
 from django.conf import settings
-from django.template.defaultfilters import slugify
+from django.contrib.contenttypes.models import ContentType
 from django.db import models
 from django.http import Http404
-from django.shortcuts import render
+from django.shortcuts import redirect, render
+from django.template.defaultfilters import slugify
+from django.template.response import TemplateResponse
+from django.utils.translation import ugettext_lazy as _
+from django.views.generic.list import ListView
 
-from ella.core.models import Listing, Category, Placement
-from ella.core.cache import get_cached_object_or_404, cache_this
+from ella.core.models import Listing, Category, Publishable, Author
+from ella.core.cache import get_cached_object_or_404, cache_this, get_cached_object
 from ella.core import custom_urls
 from ella.core.conf import core_settings
+from ella.core.managers import ListingHandler
+from ella.core.signals import object_rendering, object_rendered
+from ella.api import render_as_api
+from ella.utils.timezone import now, utc_localize
 
 __docformat__ = "restructuredtext en"
 
 # local cache for get_content_type()
 CONTENT_TYPE_MAPPING = {}
+
+
+class AuthorView(ListView):
+    model = Publishable
+    context_object_name = 'listings'
+    allow_empty = True
+    paginate_by = core_settings.CATEGORY_LISTINGS_PAGINATE_BY
+    template_name = 'page/author.html'
+
+    def get(self, request, *args, **kwargs):
+        if 'slug' not in kwargs:
+            raise Http404
+
+        # Compatibility with `paginator` tag.
+        if 'p' in request.GET:
+            self.kwargs.update({'page': request.GET['p']})
+
+        self.author = get_cached_object(Author, slug=kwargs['slug'])
+
+        response = render_as_api(request, self.author)
+        if response:
+            return response
+
+        return super(AuthorView, self).get(request, *args, **kwargs)
+
+    def get_queryset(self):
+        return self.author.recently_published()
+
+    def get_context_data(self, **kwargs):
+        base = super(AuthorView, self).get_context_data(**kwargs)
+        base.update({'object': self.author})
+
+        # Compatibility with `paginator` tag.
+        if base['page_obj']:
+            base.update({'page': base['page_obj']})
+
+        return base
+
 
 class EllaCoreView(object):
     ' Base class for class-based views used in ella.core.views. '
@@ -40,6 +84,7 @@ class EllaCoreView(object):
         " Extract parameters for `get_templates` from the context. "
         if not template_name:
             template_name = self.template_name
+
         kw = {}
         if 'object' in context:
             o = context['object']
@@ -53,23 +98,23 @@ class EllaCoreView(object):
         return get_templates(template_name, category=context['category'], **kw)
 
     def render(self, request, context, template):
-        return render(request, template, context)
+        return TemplateResponse(request, template, context)
 
     def __call__(self, request, **kwargs):
         context = self.get_context(request, **kwargs)
         return self.render(request, context, self.get_templates(context))
 
+
 class ObjectDetail(EllaCoreView):
     """
-    Renders a page for placement.  If ``url_remainder`` is specified, tries to
+    Renders a page for publishable.  If ``url_remainder`` is specified, tries to
     locate custom view via :meth:`DetailDispatcher.call_view`. If
     :meth:`DetailDispatcher.has_custom_detail` returns ``True``, calls
     :meth:`DetailDispatcher.call_custom_detail`. Otherwise renders a template
     with context containing:
 
-    * placement: ``Placement`` instance representing the URL accessed
-    * object: ``Publishable`` instance bound to the ``placement``
-    * category: ``Category`` of the ``placement``
+    * object: ``Publishable`` instance representing the URL accessed
+    * category: ``Category`` of the ``object``
     * content_type_name: slugified plural verbose name of the publishable's content type
     * content_type: ``ContentType`` of the publishable
 
@@ -81,84 +126,117 @@ class ObjectDetail(EllaCoreView):
     * ``page/content_type/<app>.<model>/object.html``
     * ``page/object.html``
 
-    .. note::
-        The category being used in selecting a template is taken from the object's
-        ``Placement``, thus one object published in many categories (even sites)
-        can have a different template every time.
-
     :param request: ``HttpRequest`` from Django
     :param category: ``Category.tree_path`` (empty if home category)
-    :param content_type: slugified ``verbose_name_plural`` of the target model
-    :param year month day: date matching the `publish_from` field of the `Placement` object
-    :param slug: slug of the `Placement`
+    :param year month day: date matching the `publish_from` field of the `Publishable` object
+    :param slug: slug of the `Publishable`
     :param url_remainder: url after the object's url, used to locate custom views in `custom_urls.resolver`
 
-    :raises Http404: if the URL is not valid and/or doesn't correspond to any valid `Placement`
+    :raises Http404: if the URL is not valid and/or doesn't correspond to any valid `Publishable`
     """
     template_name = 'object.html'
-    def __call__(self, request, category, content_type, slug, year=None, month=None, day=None, url_remainder=None):
-        context = self.get_context(request, category, content_type, slug, year, month, day)
+
+    class WrongUrl(Http404): pass
+
+    def __call__(self, request, category, slug, year=None, month=None, day=None, id=None, url_remainder=None):
+        try:
+            context = self.get_context(request, category, slug, year, month, day, id)
+        except self.WrongUrl, e:
+            message, obj = e.args
+            url = obj.get_absolute_url()
+            if url_remainder:
+                url += url_remainder
+            return redirect(url, permanent=True)
 
         obj = context['object']
+
+        object_rendering.send(sender=context['object'].__class__, request=request, category=context['category'], publishable=context['object'])
+
         # check for custom actions
         if url_remainder:
             return custom_urls.resolver.call_custom_view(request, obj, url_remainder, context)
-        elif custom_urls.resolver.has_custom_detail(obj):
+        response = render_as_api(request, obj)
+        if response:
+            return response
+
+        if custom_urls.resolver.has_custom_detail(obj):
             return custom_urls.resolver.call_custom_detail(request, context)
+
+        object_rendered.send(sender=context['object'].__class__, request=request, category=context['category'], publishable=context['object'])
 
         return self.render(request, context, self.get_templates(context))
 
-    def get_context(self, request, category, content_type, slug, year, month, day):
-        ct = get_content_type(content_type)
+    def get_context(self, request, category, slug, year, month, day, id):
 
-        cat = get_cached_object_or_404(Category, tree_path=category, site__id=settings.SITE_ID)
+        try:
+            cat = Category.objects.get_by_tree_path(category)
+        except Category.DoesNotExist:
+            # non-static url, no way to recover
+            if year:
+                raise Http404("Category with tree_path '%s' doesn't exist." % category)
+            else:
+                cat = None
 
         if year:
-            placement = get_cached_object_or_404(Placement,
+            publishable = get_cached_object_or_404(Publishable,
                         publish_from__year=year,
                         publish_from__month=month,
                         publish_from__day=day,
-                        publishable__content_type=ct,
                         category=cat,
                         slug=slug,
                         static=False
                     )
         else:
-            placement = get_cached_object_or_404(Placement, category=cat, publishable__content_type=ct, slug=slug, static=True)
+            publishable = get_cached_object_or_404(Publishable, pk=id)
 
-        # save existing object to preserve memory and SQL
-        placement.category = cat
-        placement.publishable.content_type = ct
-
-
-        if not (placement.is_active() or request.user.is_staff):
-            # future placement, render if accessed by logged in staff member
+        if not (publishable.is_published() or request.user.is_staff):
+            # future publish, render if accessed by logged in staff member
             raise Http404
 
-        obj = placement.publishable.target
+        if not year:
+            if cat is None:
+                raise self.WrongUrl('Category with tree_path %r does not exist.' % category, publishable)
+            elif not publishable.static:
+                raise self.WrongUrl('%s is not static.' % publishable, publishable)
+            elif slug != publishable.slug:
+                raise self.WrongUrl('Wrong slug in URL (%r).' % slug, publishable)
+            elif publishable.category_id != cat.pk:
+                raise self.WrongUrl('Wrong category for %s.' % publishable, publishable)
+
+        # save existing object to preserve memory and SQL
+        publishable.category = cat
 
         context = {
-                'placement' : placement,
-                'object' : obj,
+                'object' : publishable,
                 'category' : cat,
-                'content_type_name' : content_type,
-                'content_type' : ct,
+                'content_type_name' : slugify(publishable.content_type.model_class()._meta.verbose_name_plural),
+                'content_type' : publishable.content_type
             }
 
         return context
 
-def archive_year_cache_key(func, self, category):
-    return 'archive_year:%d' % category.pk
+
+def archive_year_cache_key(self, category):
+    return 'core.archive_year:%d' % category.pk
+
 
 class ListContentType(EllaCoreView):
     """
     List objects' listings according to the parameters. If no filtering is
-    applied (including pagination), the category's title page is rendered:
+    applied (including pagination), the category's title page is rendered. The
+    template used depends on ``template`` attribute for category being rendered.
+    Default template is ``category.html``, so it would look like this:
 
     * ``page/category/<tree_path>/category.html``
     * ``page/category.html``
 
-    Otherwise an archive template gets rendered:
+    If custom template is selected, let's say ``static_page.html``, it would
+    result in:
+
+    * ``page/category/<tree_path>/static_page.html``
+    * ``page/static_page.html``
+
+    If filtering is active, an archive template gets rendered:
 
     * ``page/category/<tree_path>/content_type/<app>.<model>/listing.html``
     * ``page/category/<tree_path>/listing.html``
@@ -168,7 +246,7 @@ class ListContentType(EllaCoreView):
     The context contains:
 
     * ``category``
-    * ``listings``: list of ``Listing`` objects ordered by date and priority
+    * ``listings``: list of ``Listing`` objects ordered by date
 
     * ``page``: ``django.core.paginator.Page`` instance
     * ``is_paginated``: ``True`` if there are more pages
@@ -182,110 +260,143 @@ class ListContentType(EllaCoreView):
     :param year, month, day: date matching the ``publish_from`` field of the ``Listing`` object.
     :param content_type: slugified verbose_name_plural of the target model, if omitted all content_types are listed
     :param page_no: which page to display
-    :keyword paginate_by: number of records in one page
 
     All parameters are optional, filtering is done on those supplied
 
     :raises Http404: if the specified category or content_type does not exist or if the given date is malformed.
     """
-    template_name = 'listing.html'
-    title_template_name = 'category.html'
+    empty_homepage_template_name = 'debug/empty_homepage.html'
+
+    class EmptyHomepageException(Exception): pass
 
     def __call__(self, request, **kwargs):
-        context = self.get_context(request, **kwargs)
-        template_name = self.template_name
-        if context.get('is_title_page'):
-            template_name = self.title_template_name
+        # get the category
+        try:
+            cat = self.get_category(request, kwargs.pop('category', ''))
+        except self.EmptyHomepageException:
+            return self.render(request, {}, self.empty_homepage_template_name)
+
+        # mark it as being rendered
+        object_rendering.send(sender=Category, request=request, category=cat, publishable=None)
+        object_rendered.send(sender=Category, request=request, category=cat, publishable=None)
+
+        # if API enabled and active, return a serialized category
+        response = render_as_api(request, cat)
+        if response:
+            return response
+
+        context = self.get_context(request, cat, **kwargs)
+
+        template_name = cat.template
+        archive_template = cat.app_data.ella.archive_template
+
+        if archive_template and not context.get('is_title_page'):
+            template_name = archive_template
+
         return self.render(request, context, self.get_templates(context, template_name))
 
-    @cache_this(archive_year_cache_key, timeout=60*60*24)
+    @cache_this(archive_year_cache_key, timeout=60 * 60 * 24)
     def _archive_entry_year(self, category):
         " Return ARCHIVE_ENTRY_YEAR from settings (if exists) or year of the newest object in category "
         year = getattr(settings, 'ARCHIVE_ENTRY_YEAR', None)
         if not year:
-            now = datetime.now()
+            n = now()
             try:
                 year = Listing.objects.filter(
                         category__site__id=settings.SITE_ID,
                         category__tree_path__startswith=category.tree_path,
-                        publish_from__lte=now
+                        publish_from__lte=n
                     ).values('publish_from')[0]['publish_from'].year
             except:
-                year = now.year
+                year = n.year
         return year
 
-    def get_context(self, request, category='', year=None, month=None, \
-        day=None, content_type=None, paginate_by=core_settings.CATEGORY_LISTINGS_PAGINATE_BY):
+    def get_category(self, request, category_path):
+        try:
+            cat = Category.objects.get_by_tree_path(category_path)
+        except Category.DoesNotExist:
+            # Homepage behaves differently on 404 with DEBUG mode to let user
+            # know everything is fine instead of 404.
+            if settings.DEBUG is True and not category_path:
+                raise self.EmptyHomepageException()
+
+            raise Http404(_('Category with tree path %(path)r does not exist on site %(site)s') %
+                    {'path': category_path, 'site': settings.SITE_ID})
+        return cat
+
+    def get_context(self, request, category, year=None, month=None, day=None):
+
+        ella_data = category.app_data.ella
+
+        no_home_listings = ella_data.no_home_listings
+
         # pagination
+        page_no = None
         if 'p' in request.GET and request.GET['p'].isdigit():
             page_no = int(request.GET['p'])
-        else:
-            page_no = 1
 
         # if we are not on the first page, display a different template
-        category_title_page = page_no == 1
+        category_title_page = (page_no is None or (not no_home_listings and page_no == 1)) and not year
 
-        kwa = {}
-        if year:
-            category_title_page = False
-            year = int(year)
-            kwa['publish_from__year'] = year
+        if page_no is None:
+            page_no = 1
 
-        if month:
-            try:
-                month = int(month)
-                date(year, month, 1)
-            except ValueError, e:
-                raise Http404()
-            kwa['publish_from__month'] = month
+        kwa = {'children': ella_data.child_behavior}
+
+        if 'using' in request.GET:
+            kwa['source'] = request.GET['using']
+        else:
+            kwa['source'] = ella_data.listing_handler
 
         if day:
             try:
-                day = int(day)
-                date(year, month, day)
-            except ValueError, e:
-                raise Http404()
-            kwa['publish_from__day'] = day
+                start_day = datetime(int(year), int(month), int(day))
+                kwa['date_range'] = (start_day, start_day + timedelta(seconds=24 * 3600 - 1))
+            except (ValueError, OverflowError):
+                raise Http404(_('Invalid day value %r') % day)
+        elif month:
+            try:
+                start_day = datetime(int(year), int(month), 1)
+                kwa['date_range'] = (start_day, (start_day + timedelta(days=32)).replace(day=1) - timedelta(seconds=1))
+            except (ValueError, OverflowError):
+                raise Http404(_('Invalid month value %r') % month)
+        elif year:
+            try:
+                start_day = datetime(int(year), 1, 1)
+                kwa['date_range'] = (start_day, (start_day + timedelta(days=370)).replace(day=1) - timedelta(seconds=1))
+            except (ValueError, OverflowError):
+                raise Http404(_('Invalid year value %r') % year)
 
-        cat = get_cached_object_or_404(Category, tree_path=category, site__id=settings.SITE_ID)
-        kwa['category'] = cat
-        if category:
-            kwa['children'] = Listing.objects.ALL
+        if 'date_range' in kwa:
+            kwa['date_range'] = tuple(map(utc_localize, kwa['date_range']))
 
-        if content_type:
-            ct = get_content_type(content_type)
-            kwa['content_types'] = [ ct ]
-        else:
-            ct = False
-
-        qset = Listing.objects.get_queryset_wrapper(kwa)
-        paginator = Paginator(qset, paginate_by)
-
-        if page_no > paginator.num_pages or page_no < 1:
-            raise Http404()
-
-        page = paginator.page(page_no)
-        listings = page.object_list
-
+        # basic context
         context = {
-                'page': page,
-                'is_paginated': paginator.num_pages > 1,
-                'results_per_page': paginate_by,
+            'category' : category,
+            'is_homepage': category_title_page and not category.tree_parent_id,
+            'is_title_page': category_title_page,
+            'archive_entry_year' : lambda: self._archive_entry_year(category),
+        }
 
-                'content_type' : ct,
-                'content_type_name' : content_type,
-                'listings' : listings,
-                'category' : cat,
-                'is_homepage': not bool(category) and page_no == 1 and year is None,
-                'is_title_page': category_title_page,
-                'archive_entry_year' : lambda: self._archive_entry_year(cat),
-            }
+        # no listings wanted on title page
+        if category_title_page and no_home_listings:
+            return context
+
+        # add pagination
+        page = ella_data.get_listings_page(page_no, **kwa)
+        context.update({
+            'is_paginated': page.has_other_pages(),
+            'results_per_page': page.paginator.per_page,
+            'page': page,
+            'listings' : page.object_list,
+        })
 
         return context
 
 # backwards compatibility
 object_detail = ObjectDetail()
 home = category_detail = list_content_type = ListContentType()
+
 
 def get_content_type(ct_name):
     """
@@ -317,42 +428,87 @@ def get_templates(name, slug=None, category=None, app_label=None, model_label=No
     """
     Returns templates in following format and order:
 
-        - 'page/category/%s/content_type/%s.%s/%s/%s' % ( category.path, app_label, model_label, slug, name ),
-        - 'page/category/%s/content_type/%s.%s/%s' % ( category.path, app_label, model_label, name ),
-        - 'page/category/%s/%s' % ( category.path, name ),
-        - 'page/content_type/%s.%s/%s' % ( app_label, model_label, name ),
-        - 'page/%s' % name,
+    * ``'page/category/%s/content_type/%s.%s/%s/%s' % (<CATEGORY_PART>, app_label, model_label, slug, name)``
+    * ``'page/category/%s/content_type/%s.%s/%s' % (<CATEGORY_PART>, app_label, model_label, name)``
+    * ``'page/category/%s/%s' % (<CATEGORY_PART>, name)``
+    * ``'page/content_type/%s.%s/%s' % (app_label, model_label, name)``
+    * ``'page/%s' % name``
+
+    Where ``<CATEGORY_PART>`` is derived from ``path`` attribute by these rules:
+
+    * When **no** parent exists (this is therfore root category) ``<CATEGORY_PART> = path``
+    * When exactly **one** parent exists: ``<CATEGORY_PART> = path``
+    * When multiple parent exist (category nestedN is deep in the tree)::
+
+          <CATEGORY_PART> = (
+              'nested1/nested2/../nestedN/',
+              'nested1/nested2/../nestedN-1/',
+              ...
+              'nested1'
+          )
+
+    Examples. Three categories exist having slugs **ROOT**, **NESTED1**,
+    **NESTED2** where **NESTED2**'s parent is **NESTED1**.::
+
+        ROOT
+           \
+         NESTED1
+             \
+            NESTED2
+
+    * For **ROOT**, ``<CATEGORY_PART>`` is only one - "ROOT".
+    * For **NESTED1**, ``<CATEGORY_PART>`` is only one - "NESTED1".
+    * For **NESTED2**, ``<CATEGORY_PART>`` has two elements: "NESTED1/NESTED2" and "NESTED1".
     """
+    def category_templates(category, incomplete_template, params):
+        paths = []
+        parts = category.path.split('/')
+        for i in reversed(range(1, len(parts) + 1)):
+            params.update({'pth': '/'.join(parts[:i])})
+            paths.append(incomplete_template % params)
+        return paths
+
+    FULL = 'page/category/%(pth)s/content_type/%(app_label)s.%(model_label)s/%(slug)s/%(name)s'
+    FULL_NO_SLUG = 'page/category/%(pth)s/content_type/%(app_label)s.%(model_label)s/%(name)s'
+    BY_CATEGORY = 'page/category/%(pth)s/%(name)s'
+    BY_CONTENT_TYPE = 'page/content_type/%(app_label)s.%(model_label)s/%(name)s'
+
     templates = []
+    params = {'name': name}
+
+    if app_label and model_label:
+        params.update({'app_label': app_label, 'model_label': model_label})
+
+    if slug:
+        params.update({'slug': slug})
+
     if category:
         if app_label and model_label:
             if slug:
-                templates.append('page/category/%s/content_type/%s.%s/%s/%s' % (category.path, app_label, model_label, slug, name))
-            templates.append('page/category/%s/content_type/%s.%s/%s' % (category.path, app_label, model_label, name))
-        templates.append('page/category/%s/%s' % (category.path, name))
+                templates += category_templates(category, FULL, params)
+            templates += category_templates(category, FULL_NO_SLUG, params)
+        templates += category_templates(category, BY_CATEGORY, params)
+
     if app_label and model_label:
-        templates.append('page/content_type/%s.%s/%s' % (app_label, model_label, name))
-    templates.append('page/%s' % name)
+        templates.append(BY_CONTENT_TYPE % params)
+
+    templates.append('page/%(name)s' % params)
     return templates
 
 
-def get_templates_from_placement(name, placement, slug=None, category=None, app_label=None, model_label=None):
+def get_templates_from_publishable(name, publishable):
     """
-    Returns the same template list as `get_templates` but generates the missing values from `Placement` instance.
+    Returns the same template list as `get_templates` but gets values from `Publishable` instance.
     """
-    if slug is None:
-        slug = placement.slug
-    if category is None:
-        category = placement.category
-    if app_label is None:
-        app_label = placement.publishable.content_type.app_label
-    if model_label is None:
-        model_label = placement.publishable.content_type.model
+    slug = publishable.slug
+    category = publishable.category
+    app_label = publishable.content_type.app_label
+    model_label = publishable.content_type.model
     return get_templates(name, slug, category, app_label, model_label)
 
 
-def get_export_key(func, request, count, name='', content_type=None):
-    return 'ella.core.views.export:%d:%d:%s:%s' % (
+def get_export_key(request, count, name='', content_type=None):
+    return 'core.export:%d:%d:%s:%s' % (
             settings.SITE_ID, count, name, content_type
         )
 
@@ -371,7 +527,10 @@ def export(request, count, name='', content_type=None):
         t_list.append('page/export/%s.html' % name)
     t_list.append('page/export/banner.html')
 
-    cat = get_cached_object_or_404(Category, tree_path='', site__id=settings.SITE_ID)
+    try:
+        cat = Category.objects.get_by_tree_path('')
+    except Category.DoesNotExist:
+        raise Http404()
     listing = Listing.objects.get_listing(count=count, category=cat)
     return render(
             request,
@@ -385,11 +544,11 @@ def export(request, count, name='', content_type=None):
 # Error handlers
 ##
 def page_not_found(request):
-    response = render(request, 'page/404.html', {})
+    response = TemplateResponse(request, 'page/404.html', {})
     response.status_code = 404
-    return response
+    return response.render()
 
 def handle_error(request):
-    response = render(request, 'page/500.html', {})
+    response = TemplateResponse(request, 'page/500.html', {})
     response.status_code = 500
-    return response
+    return response.render()
